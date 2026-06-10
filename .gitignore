@@ -1,0 +1,11 @@
+# Build output
+bin/
+obj/
+
+# Local game path (copy GameDir.props.example to this file and set your path)
+GameDir.props
+
+# IDE
+.vs/
+*.user
+.idea/

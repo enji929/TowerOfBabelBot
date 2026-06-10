@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <!-- Copy this file to GameDir.props and set the path to your Tower of Babel installation -->
+    <GameDir>C:\path\to\Tower Of Babel v1.0.3a</GameDir>
+  </PropertyGroup>
+</Project>
