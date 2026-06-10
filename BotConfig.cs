@@ -86,6 +86,18 @@ public static class BotConfig
     public const float REAR_DOT_THRESHOLD  = 0.3f;   // cos ~72° — "behind or side"
     public const float REAR_REPULSION_K    = 3.5f;   // constant-magnitude push
 
+    // ── Boss phase ────────────────────────────────────────────────────────────
+    public const float BOSS_CHECK_INTERVAL    = 2f;
+    public const float BOSS_ENGAGE_MULT       = 1.4f;   // stay farther from boss
+    public const float BOSS_PROJ_RADIUS_MULT  = 1.35f;  // larger projectile threat radius
+    public const float BOSS_ESCAPE_CLEAR_MULT = 1.35f;  // dodge sooner during boss fight
+
+    // ── Stuck detection ───────────────────────────────────────────────────────
+    public const float STUCK_CHECK_INTERVAL   = 0.5f;
+    public const float STUCK_THRESHOLD        = 0.12f;  // min movement per check (Unity units)
+    public const float STUCK_ESCAPE_AFTER     = 1.5f;   // seconds until escape kicks in
+    public const float STUCK_ESCAPE_STRENGTH  = 0.75f;  // weight of escape vs desired dir
+
     // ── Smoothing ────────────────────────────────────────────────────────────
     public const float MOVE_SMOOTHING = 0.72f;
 

@@ -45,6 +45,16 @@ public class BotController : MonoBehaviour
     private static float _lastLootSync = -10f;
     private static MonoBehaviour _sweepTarget = null;
 
+    // Boss detection
+    private static bool  _bossActive    = false;
+    private static float _lastBossCheck = -10f;
+
+    // Stuck detection
+    private static Vector2 _stuckCheckPos  = Vector2.zero;
+    private static float   _stuckCheckTime = -10f;
+    private static float   _stuckDuration  = 0f;
+    private static Vector2 _stuckEscapeDir = Vector2.zero;
+
     // RMB skill
     [DllImport("user32.dll")] static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, int dwExtraInfo);
     private const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
@@ -135,6 +145,57 @@ public class BotController : MonoBehaviour
         _rmbHeld = false;
     }
 
+    // ── Boss detection ─────────────────────────────────────────────────────────
+    // Scans for active boss objects every BOSS_CHECK_INTERVAL. Short-circuits on
+    // first match so FindObjectOfType cost is paid at most once per check.
+
+    private static void RefreshBossState()
+    {
+        float now = Time.time;
+        if (now - _lastBossCheck < BotConfig.BOSS_CHECK_INTERVAL) return;
+        _lastBossCheck = now;
+        _bossActive =
+            Object.FindObjectOfType<Boss_DoomThunder>()    != null ||
+            Object.FindObjectOfType<Boss_FinalBoss>()      != null ||
+            Object.FindObjectOfType<Boss_FrostJudge>()     != null ||
+            Object.FindObjectOfType<Boss_Hellblossom>()    != null ||
+            Object.FindObjectOfType<Boss_LordNightmares>() != null ||
+            Object.FindObjectOfType<Boss_SkullKing>()      != null ||
+            Object.FindObjectOfType<Boss_SwampPrincess>()  != null;
+    }
+
+    // ── Stuck detection ────────────────────────────────────────────────────────
+    // Returns a random escape direction if the bot hasn't moved enough for
+    // STUCK_ESCAPE_AFTER seconds. Resets automatically once movement resumes.
+
+    private static Vector2 GetStuckEscape(Vector2 pos)
+    {
+        float now = Time.time;
+        if (now - _stuckCheckTime < BotConfig.STUCK_CHECK_INTERVAL)
+            return _stuckDuration >= BotConfig.STUCK_ESCAPE_AFTER ? _stuckEscapeDir : Vector2.zero;
+
+        float moved = (pos - _stuckCheckPos).magnitude;
+        _stuckCheckPos  = pos;
+        _stuckCheckTime = now;
+
+        if (moved < BotConfig.STUCK_THRESHOLD)
+        {
+            _stuckDuration += BotConfig.STUCK_CHECK_INTERVAL;
+            if (_stuckEscapeDir == Vector2.zero)
+            {
+                float angle = UnityEngine.Random.value * 2f * Mathf.PI;
+                _stuckEscapeDir = new Vector2(Mathf.Cos(angle), Mathf.Sin(angle));
+            }
+        }
+        else
+        {
+            _stuckDuration  = 0f;
+            _stuckEscapeDir = Vector2.zero;
+        }
+
+        return _stuckDuration >= BotConfig.STUCK_ESCAPE_AFTER ? _stuckEscapeDir : Vector2.zero;
+    }
+
     // ── Animation ─────────────────────────────────────────────────────────────
 
     private static void TryDriveAnimation(bool verbose = false)
@@ -173,6 +234,11 @@ public class BotController : MonoBehaviour
         _cachedAnim = null;
         _rmbHeld = false;
         _sweepTarget = null;
+        _bossActive = false;
+        _lastBossCheck = -10f;
+        _stuckDuration = 0f;
+        _stuckEscapeDir = Vector2.zero;
+        _stuckCheckTime = -10f;
         _gm = null; _vm = null; _svm = null;
     }
 
@@ -199,9 +265,11 @@ public class BotController : MonoBehaviour
             float mpRatio = _lastMaxMp > 0f ? _lastMp / _lastMaxMp : 0f;
             string stateColor = BotEnabled ? "#7fdc7f" : "#888";
             string modeStr = !BotEnabled ? "" :
-                _hpPhase == HpPhase.Flee    ? "<color=#ff4444><b>FLEE</b></color>"    :
-                _hpPhase == HpPhase.Caution ? "<color=#ffaa00><b>CAUTION</b></color>" :
-                InSweepMode                 ? "<color=#7fd7ff>SWEEP</color>"           :
+                _hpPhase == HpPhase.Flee    ? "<color=#ff4444><b>FLEE</b></color>"       :
+                _hpPhase == HpPhase.Caution ? "<color=#ffaa00><b>CAUTION</b></color>"    :
+                _bossActive && InSweepMode  ? "<color=#ff88ff>BOSS·SWEEP</color>"        :
+                _bossActive                 ? "<color=#ff66cc><b>BOSS FIGHT</b></color>" :
+                InSweepMode                 ? "<color=#7fd7ff>SWEEP</color>"              :
                                               "<color=#ffcc55>COMBAT</color>";
             string rmbStr = _rmbHeld ? "<color=#aaffaa>HELD</color>" : "off";
             string obsStr = _observedGameSpeed > 0.1f ? $"{_observedGameSpeed:F2}" : "n/a";
@@ -283,12 +351,41 @@ public class BotController : MonoBehaviour
         _levelUpWasOpen = isOpen;
     }
 
-    // Skill priority table — fill in real IDs from BepInEx logs after a few runs.
-    // tier 3 = high (speed, regen), tier 2 = medium, tier 1 = low, 0 = unknown
+    // Skill priority tiers: 3 = high, 2 = medium, 1 = low.
+    // IDs are 4-digit: 11XX = warrior, 12XX = fire mage, 13XX = ice mage,
+    // 14XX = thunder mage, 15XX = light/priest, 16XX = dark/necro.
+    // Variants XX01–XX04: 01/02 = active attack skills (high value for bot),
+    // 03 = passive/buff (medium), 04 = support/regen (low-medium).
+    // Fill in exact values after checking BepInEx log lines:
+    //   "Bot: skill option [N] id=XXXX level=Y"
     private static readonly Dictionary<int, int> _skillPriority = new Dictionary<int, int>
     {
-        // Fill after reading logs: priority[id] = tier;
-        // priority[12] = 3; // example: move speed
+        // ── Warrior (11XX) ──
+        { 1101, 3 }, { 1102, 3 },   // active attack skills — high priority
+        { 1103, 2 }, { 1104, 2 },   // passive/support
+
+        // ── Fire Mage (12XX) ──
+        { 1201, 3 }, { 1202, 3 },
+        { 1203, 2 }, { 1204, 1 },
+
+        // ── Ice Mage (13XX) ──
+        { 1301, 3 }, { 1302, 3 },
+        { 1303, 2 }, { 1304, 1 },
+
+        // ── Thunder Mage (14XX) ──
+        { 1401, 3 }, { 1402, 3 },
+        { 1403, 2 }, { 1404, 1 },
+
+        // ── Light / Priest (15XX) ──
+        { 1501, 2 }, { 1502, 2 },
+        { 1503, 3 }, { 1504, 2 },   // 1503 likely healing — high for survival
+
+        // ── Dark / Necro (16XX) ──
+        { 1601, 3 }, { 1602, 3 },
+        { 1603, 2 }, { 1604, 1 },
+
+        // ── Special ──
+        { 1251, 3 },
     };
 
     private static int ChooseBestSkill(SkillSelector ss)
@@ -296,20 +393,45 @@ public class BotController : MonoBehaviour
         if (ss == null || ss.currentPickSkillId == null) return 0;
 
         int bestIdx = 0, bestScore = int.MinValue;
-        for (int i = 0; i < ss.currentPickSkillId.Count; i++)
+        int optionCount = ss.currentPickSkillId.Count;
+
+        // Count how many options are upgrades vs new — prefer upgrades when
+        // multiple are available, but don't skip a tier-3 new skill.
+        int upgradeCount = 0;
+        for (int i = 0; i < optionCount; i++)
+        {
+            int id = ss.currentPickSkillId[i];
+            if (id <= 0) continue;
+            int lv = 0;
+            try { lv = ss.GetSkillLevel(id); } catch { }
+            if (lv > 0) upgradeCount++;
+        }
+
+        for (int i = 0; i < optionCount; i++)
         {
             int skillId = ss.currentPickSkillId[i];
             if (skillId <= 0) continue;
             int curLevel = 0;
             try { curLevel = ss.GetSkillLevel(skillId); } catch { }
 
-            Plugin.Log.LogInfo($"Bot: skill option [{i}] id={skillId} level={curLevel}");
+            int tier = _skillPriority.TryGetValue(skillId, out var t) ? t : 1;
 
-            int tier = _skillPriority.TryGetValue(skillId, out var t) ? t : 0;
-            int upgradeScore = curLevel == 0 ? 20 : 50 + curLevel * 30;
-            int score = tier * 100 + upgradeScore;
+            // Upgrading an existing skill is strongly preferred: each existing
+            // level adds 40 points on top of tier weight.
+            int upgradeBonus = curLevel > 0 ? 60 + curLevel * 40 : 0;
+
+            // New skill penalty when upgrades are available — only relevant when
+            // there IS an upgrade option so we don't skip it for a new skill.
+            int newPenalty = (curLevel == 0 && upgradeCount > 0) ? 20 : 0;
+
+            int score = tier * 100 + upgradeBonus - newPenalty;
+
+            Plugin.Log.LogInfo($"Bot: skill [{i}] id={skillId} lv={curLevel} tier={tier} score={score}");
+
             if (score > bestScore) { bestScore = score; bestIdx = i; }
         }
+
+        Plugin.Log.LogInfo($"Bot: picked skill index {bestIdx}");
         return bestIdx;
     }
 
@@ -379,6 +501,7 @@ public class BotController : MonoBehaviour
 
         RefreshLootCache();
         ThreatCache.Refresh();
+        RefreshBossState();
 
         var threats = ThreatCache.Monsters;
         var bullets = ThreatCache.Projectiles;
@@ -404,6 +527,14 @@ public class BotController : MonoBehaviour
             }
             dir = Normalize(desire);
         }
+
+        // Stuck escape: if the bot hasn't moved for STUCK_ESCAPE_AFTER seconds,
+        // blend in a random direction to break free from corners/walls.
+        Vector2 stuckEsc = GetStuckEscape(pos);
+        if (stuckEsc != Vector2.zero)
+            dir = dir != Vector2.zero
+                ? Normalize(dir * (1f - BotConfig.STUCK_ESCAPE_STRENGTH) + stuckEsc * BotConfig.STUCK_ESCAPE_STRENGTH)
+                : stuckEsc;
 
         // When dir is zero (no target) we must reset _prevMove explicitly.
         // Normalize(Lerp(prev, zero, t)) = Normalize(prev*(1-t)) = prev — bot never stops otherwise.
@@ -558,7 +689,8 @@ public class BotController : MonoBehaviour
         float span = BotConfig.ENGAGE_HP_HIGH - BotConfig.ENGAGE_HP_LOW;
         float t = span > 0f ? (ratio - BotConfig.ENGAGE_HP_LOW) / span : 1f;
         t = Mathf.Clamp01(t);
-        return aggressive * t + safe * (1f - t);
+        float dist = aggressive * t + safe * (1f - t);
+        return _bossActive ? dist * BotConfig.BOSS_ENGAGE_MULT : dist;
     }
 
     // ── EnemyEngagementForce ───────────────────────────────────────────────────
@@ -621,7 +753,8 @@ public class BotController : MonoBehaviour
         force += AttrForce(pos, LootRegistry.Rune,    L,                           safety);
         force += AttrForce(pos, LootRegistry.Token,   L,                           safety);
         force += AttrForce(pos, LootRegistry.Greed,   L,                           safety);
-        force += AttrForce(pos, LootRegistry.Arcane,  L,                           safety);
+        float arcaneMult = _lastMaxMp > 0f && (_lastMp / _lastMaxMp) < 0.3f ? 3f : 1f;
+        force += AttrForce(pos, LootRegistry.Arcane,  L * arcaneMult,              safety);
         force += AttrForce(pos, LootRegistry.Food,    C * foodMult,                safety);
         force += AttrForce(pos, LootRegistry.Sealing, L,                           safety);
 
@@ -784,8 +917,9 @@ public class BotController : MonoBehaviour
         Vector2 desire,
         float playerSpeed)
     {
-        float reach  = playerSpeed * BotConfig.ESCAPE_HORIZON;
-        float margin = BotConfig.PROJ_THREAT_RADIUS + reach;
+        float reach      = playerSpeed * BotConfig.ESCAPE_HORIZON;
+        float projRadius = BotConfig.PROJ_THREAT_RADIUS * (_bossActive ? BotConfig.BOSS_PROJ_RADIUS_MULT : 1f);
+        float margin     = projRadius + reach;
         float horizon = BotConfig.ESCAPE_HORIZON;
 
         _threatBufCount = 0;
@@ -831,7 +965,7 @@ public class BotController : MonoBehaviour
 
         Vector2 defaultD = desire.sqrMagnitude > 0f ? desire : Vector2.zero;
         float defaultClear = DirClearance(pos, defaultD, playerSpeed);
-        float safe = BotConfig.ESCAPE_SAFE_CLEARANCE;
+        float safe  = BotConfig.ESCAPE_SAFE_CLEARANCE * (_bossActive ? BotConfig.BOSS_ESCAPE_CLEAR_MULT : 1f);
         float panic = BotConfig.ESCAPE_PANIC_CLEARANCE;
         float urgency;
         if (defaultClear >= safe) urgency = 0f;
