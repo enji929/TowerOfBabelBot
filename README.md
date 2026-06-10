@@ -6,6 +6,10 @@ Toggle the bot on/off with **F1** at any time.
 
 ![TowerOfBabelBot in action](preview.png)
 
+> **⚠️ Work in progress** — the bot is actively being developed. Bugs and unexpected behaviour are possible.
+
+> **⚠️ В разработке** — бот активно дорабатывается. Возможны баги и непредвиденное поведение.
+
 ---
 
 ## Описание (Russian)
