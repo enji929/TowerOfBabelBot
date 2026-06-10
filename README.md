@@ -4,6 +4,8 @@ A BepInEx IL2CPP mod for **Tower of Babel v1.0.3a** that fully automates player 
 
 Toggle the bot on/off with **F1** at any time.
 
+![TowerOfBabelBot in action](preview.png)
+
 ---
 
 ## Описание (Russian)
