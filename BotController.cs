@@ -902,9 +902,9 @@ public class BotController : MonoBehaviour
 
     private struct EscapeResult { public Vector2 dir; public float urgency; }
 
-    private const int MaxThreatBullets = 32;
-    private const int EscapeT = 6;  // BotConfig.ESCAPE_TIME_SAMPLES
-    private const int EscapeN = 24; // BotConfig.ESCAPE_DIRECTIONS
+    private const int MaxThreatBullets = 48;  // was 32
+    private const int EscapeT = 10;           // was 6 — BotConfig.ESCAPE_TIME_SAMPLES
+    private const int EscapeN = 36;           // was 24 — BotConfig.ESCAPE_DIRECTIONS
     private static readonly ThreatSample[] _threatBuf  = new ThreatSample[MaxThreatBullets];
     private static readonly float[]        _timeBuf    = new float[EscapeT];
     private static readonly Vector2[]      _bulletFlat = new Vector2[EscapeT * MaxThreatBullets];
@@ -943,13 +943,19 @@ public class BotController : MonoBehaviour
         }
         if (_threatBufCount == 0) return new EscapeResult { dir = Vector2.zero, urgency = 0f };
 
+        // Front-loaded time samples: denser near t=0, sparser near horizon.
+        // Formula 1 - sqrt(1-frac) maps [0,1] → [0,1] with more points near 0.
         for (int i = 0; i < EscapeT; i++)
-            _timeBuf[i] = (i / (float)Mathf.Max(EscapeT - 1, 1)) * horizon;
+        {
+            float frac = (float)i / Mathf.Max(EscapeT - 1, 1);
+            _timeBuf[i] = horizon * (1f - Mathf.Sqrt(Mathf.Max(0f, 1f - frac)));
+        }
 
         for (int ti = 0; ti < EscapeT; ti++)
             for (int bi = 0; bi < _threatBufCount; bi++)
                 _bulletFlat[ti * MaxThreatBullets + bi] = _threatBuf[bi].pos + _threatBuf[bi].vel * _timeBuf[ti];
 
+        // Score 36 directions: clearance with proportional alignment bonus.
         Vector2 bestDir = Vector2.zero;
         float bestScore = -1e18f;
         for (int k = 0; k < EscapeN; k++)
@@ -957,22 +963,47 @@ public class BotController : MonoBehaviour
             float ang = (2f * Mathf.PI * k) / EscapeN;
             Vector2 d = new Vector2(Mathf.Cos(ang), Mathf.Sin(ang));
             float clearance = DirClearance(pos, d, playerSpeed);
-            float align = desire.sqrMagnitude > 0f ? Vector2.Dot(d, desire) : 0f;
-            float penalty = EnemyPathPenalty(pos, d, playerSpeed, threats);
-            float score = clearance + BotConfig.ESCAPE_ALIGN_BONUS * align - penalty;
+            float align     = desire.sqrMagnitude > 0f ? Mathf.Max(0f, Vector2.Dot(d, desire)) : 0f;
+            float penalty   = EnemyPathPenalty(pos, d, playerSpeed, threats);
+            // Proportional bonus: aligned dirs get up to ESCAPE_ALIGN_FACTOR% more score
+            float score = clearance * (1f + BotConfig.ESCAPE_ALIGN_FACTOR * align) - penalty;
             if (score > bestScore) { bestScore = score; bestDir = d; }
         }
 
-        Vector2 defaultD = desire.sqrMagnitude > 0f ? desire : Vector2.zero;
-        float defaultClear = DirClearance(pos, defaultD, playerSpeed);
-        float safe  = BotConfig.ESCAPE_SAFE_CLEARANCE * (_bossActive ? BotConfig.BOSS_ESCAPE_CLEAR_MULT : 1f);
-        float panic = BotConfig.ESCAPE_PANIC_CLEARANCE;
+        // Urgency: time-to-impact based — how soon does the nearest bullet arrive?
+        float tti = ComputeMinTTI(pos, projRadius, horizon);
         float urgency;
-        if (defaultClear >= safe) urgency = 0f;
-        else if (defaultClear <= panic) urgency = 1f;
-        else urgency = (safe - defaultClear) / Mathf.Max(safe - panic, 1e-4f);
+        if (tti >= horizon)
+            urgency = 0f;
+        else if (tti <= BotConfig.ESCAPE_PANIC_TTI)
+            urgency = 1f;
+        else
+            urgency = 1f - (tti - BotConfig.ESCAPE_PANIC_TTI) /
+                      Mathf.Max(horizon - BotConfig.ESCAPE_PANIC_TTI, 1e-4f);
 
         return new EscapeResult { dir = bestDir, urgency = urgency };
+    }
+
+    // Minimum time-to-impact: earliest moment any bullet reaches the player (stationary worst-case).
+    private static float ComputeMinTTI(Vector2 pos, float threatRadius, float horizon)
+    {
+        float minTTI = float.MaxValue;
+        for (int bi = 0; bi < _threatBufCount; bi++)
+        {
+            var p = _threatBuf[bi];
+            float speedSq = p.vel.sqrMagnitude;
+            if (speedSq < 1f)
+            {
+                if ((p.pos - pos).sqrMagnitude < threatRadius * threatRadius) return 0f;
+                continue;
+            }
+            Vector2 relPos = pos - p.pos;
+            float t = Vector2.Dot(relPos, p.vel) / speedSq;
+            t = Mathf.Clamp(t, 0f, horizon);
+            if ((pos - (p.pos + p.vel * t)).magnitude < threatRadius && t < minTTI)
+                minTTI = t;
+        }
+        return minTTI == float.MaxValue ? horizon + 1f : minTTI;
     }
 
     private static float DirClearance(Vector2 pos, Vector2 d, float speed)

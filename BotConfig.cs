@@ -62,15 +62,16 @@ public static class BotConfig
     // ── Predictive lookahead ─────────────────────────────────────────────────
     public const float ENEMY_LOOKAHEAD = 0.25f;                         // seconds
 
-    // ── Projectile escape (24-direction sampler) ─────────────────────────────
-    public const float PROJ_THREAT_RADIUS = 110f * WORLD_SCALE;
-    public const int ESCAPE_DIRECTIONS = 24;
-    public const float ESCAPE_HORIZON = 0.55f;                          // seconds
-    public const int ESCAPE_TIME_SAMPLES = 6;
-    public const float ESCAPE_SAFE_CLEARANCE = 130f * WORLD_SCALE;
-    public const float ESCAPE_PANIC_CLEARANCE = 45f * WORLD_SCALE;
-    public const float ESCAPE_ALIGN_BONUS = 18f * WORLD_SCALE;          // d^1 multiplier on dot product
-    public const float ENEMY_AVOID_DIST = 95f * WORLD_SCALE;
+    // ── Projectile escape (36-direction sampler) ─────────────────────────────
+    public const float PROJ_THREAT_RADIUS  = 110f * WORLD_SCALE;
+    public const int   ESCAPE_DIRECTIONS   = 36;                         // was 24
+    public const float ESCAPE_HORIZON      = 0.60f;                      // seconds lookahead
+    public const int   ESCAPE_TIME_SAMPLES = 10;                         // was 6, front-loaded
+    public const float ESCAPE_SAFE_CLEARANCE  = 130f * WORLD_SCALE;
+    public const float ESCAPE_PANIC_CLEARANCE = 45f  * WORLD_SCALE;
+    public const float ESCAPE_PANIC_TTI    = 0.12f;  // seconds — full urgency when bullet this close in time
+    public const float ESCAPE_ALIGN_FACTOR = 0.30f;  // % bonus for escape dir aligned with desired dir
+    public const float ENEMY_AVOID_DIST    = 95f * WORLD_SCALE;
     // penalty = (gap) * K  → d^1 → K_units = K_brotato / WORLD_SCALE
     public const float ENEMY_AVOID_PENALTY = 3f / WORLD_SCALE;          // 300
 
