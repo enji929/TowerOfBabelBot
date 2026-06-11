@@ -1,7 +1,10 @@
 // Movement logic ported from HelpFreedom/brotato-full-autobot (GPL-3.0).
 // Source: mods-unpacked/BlackTriangle-FullAutoBot/bot/potential_field.gd
 
+using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
 using Il2CppInterop.Runtime.Injection;
 using System.Runtime.InteropServices;
 using UnityEngine;
@@ -240,6 +243,28 @@ public class BotController : MonoBehaviour
         _stuckEscapeDir = Vector2.zero;
         _stuckCheckTime = -10f;
         _gm = null; _vm = null; _svm = null;
+        _skillApiScanned = false;
+        _blessReflSearched = false;
+        _blessObj = null;
+    }
+
+    // Called by NativeHook when a new Player pointer is detected (= new run after death).
+    public static void OnNewRunDetected()
+    {
+        ThreatCache.Reset();
+        LootRegistry.Clear();
+        _lastLootSync = -10f;
+        _lastLootCompact = -10f;
+        _cachedAnim = null;
+        ReleaseRmb();
+        _sweepTarget = null;
+        _bossActive = false;
+        _lastBossCheck = -10f;
+        _stuckDuration = 0f;
+        _stuckEscapeDir = Vector2.zero;
+        _stuckCheckTime = -10f;
+        _vm = null; _svm = null;
+        Plugin.Log.LogInfo("Bot: new run detected, state reset");
     }
 
     private void OnGUI()
@@ -273,20 +298,24 @@ public class BotController : MonoBehaviour
                                               "<color=#ffcc55>COMBAT</color>";
             string rmbStr = _rmbHeld ? "<color=#aaffaa>HELD</color>" : "off";
             string obsStr = _observedGameSpeed > 0.1f ? $"{_observedGameSpeed:F2}" : "n/a";
+            string gmStr  = _gm != null ? "ok" : "<color=#ff6666>null</color>";
             int lootTotal = LootRegistry.Exp.Count + LootRegistry.Gold.Count + LootRegistry.Jewel.Count
                           + LootRegistry.Gem.Count + LootRegistry.Magnet.Count + LootRegistry.Rune.Count
                           + LootRegistry.Token.Count + LootRegistry.Greed.Count + LootRegistry.Arcane.Count
                           + LootRegistry.Food.Count + LootRegistry.Sealing.Count;
+            string sweepStr = InSweepMode
+                ? (_sweepTarget != null ? $"→{((Vector2)_sweepTarget.transform.position - _lastPlayerPos).magnitude:F1}u" : "no target")
+                : "off";
             _guiText =
                 $"<b>TowerOfBabelBot</b>\n" +
                 $"Bot: <color={stateColor}><b>{(BotEnabled ? "ON" : "OFF")}</b></color>  (F1)  {modeStr}\n" +
                 $"HP: {_lastHp:F0}/{_lastMaxHp:F0} ({hpRatio:P0})  MP: {_lastMp:F0}/{_lastMaxMp:F0} ({mpRatio:P0})\n" +
-                $"Speed: {_lastEffectiveSpeed:F2} ({_lastSpeedSource})  RMB: {rmbStr}\n" +
+                $"Speed: {_lastEffectiveSpeed:F2} ({_lastSpeedSource})  RMB: {rmbStr}  GM: {gmStr}\n" +
                 $"Threats: {ThreatCache.Monsters.Count}  Exp: {LootRegistry.Exp.Count}  Loot: {lootTotal}\n" +
-                $"Observed: {obsStr}";
+                $"Sweep: {sweepStr}  Observed: {obsStr}";
         }
 
-        var rect = new Rect(8, 8, 280, 130);
+        var rect = new Rect(8, 8, 300, 145);
         GUI.Box(rect, "", _guiBoxStyle);
         GUI.Label(new Rect(rect.x + 8, rect.y + 6, rect.width - 16, rect.height - 12), _guiText, _guiLabelStyle);
     }
@@ -331,17 +360,19 @@ public class BotController : MonoBehaviour
     private void HandleSkillSelect()
     {
         if (_gm == null) return;
-        var rm = _gm.runManager;  // cached once — 4 accesses → 1
+        var rm = _gm.runManager;
         if (rm == null) return;
         var win = rm.windowLevelUp;
         bool isOpen = win != null && win.activeInHierarchy;
         if (isOpen && !_levelUpWasOpen) Plugin.Log.LogInfo("Bot: level-up window opened");
         if (isOpen)
         {
+            var ss = rm.skillSelector;
+            if (ss != null) ScanSkillSelectorApi(ss);
             _skillSelectTimer += Time.unscaledDeltaTime;
             if (_skillSelectTimer >= SkillSelectDelay)
             {
-                int pick = ChooseBestSkill(rm.skillSelector);
+                int pick = ChooseBestSkill(ss);
                 rm.ConfirmSelectSkill(pick);
                 Plugin.Log.LogInfo($"Bot: picked skill index {pick}");
                 _skillSelectTimer = 0f;
@@ -349,6 +380,68 @@ public class BotController : MonoBehaviour
         }
         else _skillSelectTimer = 0f;
         _levelUpWasOpen = isOpen;
+    }
+
+    // ── Skill API discovery ────────────────────────────────────────────────────
+    // One-time reflection dump of SkillSelector so we can find the right method
+    // for getting skill names. Runs on a background thread to avoid blocking
+    // Update() — IL2CPP GetMethods() can take several seconds on first call.
+
+    private static bool _skillApiScanned = false;
+    private static volatile string _skillApiResult = null;
+
+    private static void ScanSkillSelectorApi(SkillSelector ss)
+    {
+        if (_skillApiScanned) return;
+        _skillApiScanned = true;
+        System.Threading.Tasks.Task.Run(() =>
+        {
+            var sb = new System.Text.StringBuilder();
+            try
+            {
+                var flags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly;
+                foreach (var m in typeof(SkillSelector).GetMethods(flags))
+                {
+                    var parms = string.Join(", ", m.GetParameters().Select(p => $"{p.ParameterType.Name} {p.Name}"));
+                    sb.AppendLine($"[SkillAPI] {m.ReturnType.Name} {m.Name}({parms})");
+                }
+                foreach (var p in typeof(SkillSelector).GetProperties(flags))
+                    sb.AppendLine($"[SkillAPI] prop {p.PropertyType.Name} {p.Name}");
+            }
+            catch (Exception ex) { sb.AppendLine($"[SkillAPI] scan failed: {ex.Message}"); }
+            _skillApiResult = sb.ToString();
+        });
+    }
+
+    // Try common method-name patterns to retrieve a human-readable skill name.
+    // Method lookup is cached after first search so reflection cost is paid once.
+    private static readonly string[] _skillNameMethodCandidates =
+        { "GetSkillName", "GetName", "GetSkillTitle", "GetSkillLabel",
+          "GetSkillDesc",  "GetSkillInfo", "GetSkillData" };
+    private static MethodInfo _cachedSkillNameMethod = null;
+    private static bool _skillNameMethodSearched = false;
+
+    private static string TryGetSkillName(SkillSelector ss, int skillId)
+    {
+        if (ss == null) return null;
+        if (!_skillNameMethodSearched)
+        {
+            _skillNameMethodSearched = true;
+            foreach (var name in _skillNameMethodCandidates)
+            {
+                var m = typeof(SkillSelector).GetMethod(name, new[] { typeof(int) });
+                if (m != null) { _cachedSkillNameMethod = m; break; }
+            }
+        }
+        if (_cachedSkillNameMethod == null) return null;
+        try
+        {
+            var result = _cachedSkillNameMethod.Invoke(ss, new object[] { skillId });
+            if (result == null) return null;
+            string s = result as string ?? result.ToString();
+            return (!string.IsNullOrEmpty(s) && s != "0") ? s : null;
+        }
+        catch { return null; }
     }
 
     // Skill priority tiers: 3 = high, 2 = medium, 1 = low.
@@ -388,9 +481,118 @@ public class BotController : MonoBehaviour
         { 1251, 3 },
     };
 
+    // Mapping from skill ID prefix (id/100) to bless-type index in _blessClassBonus.
+    // 0=Physical(11XX), 1=Fire(12XX), 2=Ice(13XX), 3=Thunder(14XX), 4=Light(15XX), 5=Dark(16XX)
+    private static int SkillClassIndex(int skillId)
+    {
+        int prefix = skillId / 100;
+        return prefix switch { 11 => 0, 12 => 1, 13 => 2, 14 => 3, 15 => 4, 16 => 5, _ => -1 };
+    }
+
+    // Cached reflection state for BlessLevel reading.
+    // We don't know which singleton class owns BlessLevel* until runtime,
+    // so we scan known manager singletons once and cache the found instance + properties.
+    private static bool   _blessReflSearched = false;
+    private static object _blessObj = null;
+
+    private static void ScanBlessLevelSource()
+    {
+        if (_blessReflSearched) return;
+        _blessReflSearched = true;
+        System.Threading.Tasks.Task.Run(() =>
+        {
+            // Try known manager types — SVM, GM, VM
+            object[] candidates = null;
+            try { candidates = new object[] { SVM.ins, GM.ins, VM.ins }; }
+            catch { return; }
+            foreach (var obj in candidates)
+            {
+                if (obj == null) continue;
+                var type = obj.GetType();
+                var prop = type.GetProperty("BlessLevelFire",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                if (prop != null)
+                {
+                    _blessObj = obj;
+                    Plugin.Log.LogInfo($"[BlessLevel] found on {type.Name}");
+                    return;
+                }
+            }
+            // Broader scan: enumerate all loaded types with BlessLevelFire property
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                System.Type[] types = null;
+                try { types = asm.GetTypes(); } catch { continue; }
+                foreach (var type in types)
+                {
+                    var prop = type.GetProperty("BlessLevelFire",
+                        System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                    if (prop == null) continue;
+                    // Try to get singleton via static 'ins' or 'Instance'
+                    var insProp = type.GetProperty("ins",
+                        System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
+                        ?? type.GetProperty("Instance",
+                        System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+                    if (insProp == null) continue;
+                    try
+                    {
+                        var inst = insProp.GetValue(null);
+                        if (inst == null) continue;
+                        _blessObj = inst;
+                        Plugin.Log.LogInfo($"[BlessLevel] found on {type.Name} via scan");
+                        return;
+                    }
+                    catch { }
+                }
+            }
+            Plugin.Log.LogInfo("[BlessLevel] not found — bless-aware skill pick disabled");
+        });
+    }
+
+    // Read BlessLevel* arrays and return per-class total bless level.
+    // 0=Physical 1=Fire 2=Ice 3=Thunder 4=Light 5=Dark. Returns null if unavailable.
+    private static int[] ReadBlessLevels()
+    {
+        ScanBlessLevelSource();
+        if (_blessObj == null) return null;
+        var type = _blessObj.GetType();
+        var totals = new int[6];
+        string[] propNames = { "BlessLevelPhysical", "BlessLevelFire", "BlessLevelIce",
+                               "BlessLevelThunder",  "BlessLevelLight", "BlessLevelDark" };
+        try
+        {
+            for (int c = 0; c < 6; c++)
+            {
+                var prop = type.GetProperty(propNames[c],
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                if (prop == null) continue;
+                var arr = prop.GetValue(_blessObj) as System.Array;
+                if (arr == null) continue;
+                foreach (var elem in arr)
+                    try { totals[c] += (int)(dynamic)elem; } catch { }
+            }
+        }
+        catch { return null; }
+        return totals;
+    }
+
     private static int ChooseBestSkill(SkillSelector ss)
     {
         if (ss == null || ss.currentPickSkillId == null) return 0;
+
+        // Bless bonus: skills matching the dominant equipment bless type get +80.
+        // If no dominant type (all zero or tied), no bonus applied.
+        int[] bless = ReadBlessLevels();
+        int blessBonusClass = -1;
+        if (bless != null)
+        {
+            int maxBless = 0;
+            for (int b = 0; b < bless.Length; b++) if (bless[b] > maxBless) { maxBless = bless[b]; blessBonusClass = b; }
+            // Only apply if dominant class is clearly ahead (>0) to avoid arbitrary tie-breaking
+            if (maxBless == 0) blessBonusClass = -1;
+        }
+        if (blessBonusClass >= 0)
+            Plugin.Log.LogInfo($"[Skill] equip bless dominant class={blessBonusClass} levels=[{string.Join(",", bless)}]");
 
         int bestIdx = 0, bestScore = int.MinValue;
         int optionCount = ss.currentPickSkillId.Count;
@@ -424,9 +626,13 @@ public class BotController : MonoBehaviour
             // there IS an upgrade option so we don't skip it for a new skill.
             int newPenalty = (curLevel == 0 && upgradeCount > 0) ? 20 : 0;
 
-            int score = tier * 100 + upgradeBonus - newPenalty;
+            // Equipment bless bonus: reward skills that match the dominant bless type.
+            int equipBonus = (blessBonusClass >= 0 && SkillClassIndex(skillId) == blessBonusClass) ? 80 : 0;
 
-            Plugin.Log.LogInfo($"Bot: skill [{i}] id={skillId} lv={curLevel} tier={tier} score={score}");
+            int score = tier * 100 + upgradeBonus - newPenalty + equipBonus;
+
+            string skillName = TryGetSkillName(ss, skillId) ?? "?";
+            Plugin.Log.LogInfo($"[Skill] id={skillId} name=\"{skillName}\" lv={curLevel} tier={tier} equipBonus={equipBonus} score={score}");
 
             if (score > bestScore) { bestScore = score; bestIdx = i; }
         }
@@ -528,9 +734,9 @@ public class BotController : MonoBehaviour
             dir = Normalize(desire);
         }
 
-        // Stuck escape: if the bot hasn't moved for STUCK_ESCAPE_AFTER seconds,
-        // blend in a random direction to break free from corners/walls.
-        Vector2 stuckEsc = GetStuckEscape(pos);
+        // Stuck escape disabled during flee — enemy repulsion already handles corners,
+        // and a random 75% direction override can send the bot straight into mobs.
+        Vector2 stuckEsc = _hpPhase != HpPhase.Flee ? GetStuckEscape(pos) : Vector2.zero;
         if (stuckEsc != Vector2.zero)
             dir = dir != Vector2.zero
                 ? Normalize(dir * (1f - BotConfig.STUCK_ESCAPE_STRENGTH) + stuckEsc * BotConfig.STUCK_ESCAPE_STRENGTH)
@@ -568,7 +774,25 @@ public class BotController : MonoBehaviour
                 away = Normalize(away) * (1f - esc.urgency) + esc.dir * esc.urgency;
         }
 
-        away += AttrForce(pos, LootRegistry.Food, BotConfig.CONSUMABLE_ATTRACTION * BotConfig.FOOD_FLEE_MULT, 1f);
+        // Food attraction during flee — only chase food that doesn't require running
+        // through enemies. Without this check, FOOD_FLEE_MULT=6 overpowers repulsion
+        // and sends the bot straight into mob clusters.
+        var food = LootRegistry.Food;
+        if (food.Count > 0)
+        {
+            float k = BotConfig.CONSUMABLE_ATTRACTION * BotConfig.FOOD_FLEE_MULT;
+            for (int i = 0; i < food.Count; i++)
+            {
+                var item = food[i];
+                if (item == null) continue;
+                Vector2 foodPos = (Vector2)item.transform.position;
+                float clear = threats.Count == 0 ? 1f : PathClearanceFactor(pos, foodPos, threats);
+                if (clear < 0.3f) continue;
+                Vector2 diff = foodPos - pos;
+                float d = Mathf.Max(diff.magnitude, 0.01f);
+                away += (diff / d) * (k * clear) / d;
+            }
+        }
 
         return Normalize(away);
     }
@@ -720,7 +944,11 @@ public class BotController : MonoBehaviour
     private static Vector2 ClosestApproach(Vector2 pos, ThreatSample t)
     {
         if (t.vel.sqrMagnitude < 1e-4f) return t.pos;
-        return t.pos + t.vel * BotConfig.ENEMY_LOOKAHEAD;
+        // Time of closest approach on enemy trajectory: minimises |pos - (t.pos + vel*tc)|
+        // Without clamping, a fast enemy overshooting the player produces a predicted position
+        // behind them — repulsion then pushes the bot toward the enemy instead of away.
+        float tc = Vector2.Dot(pos - t.pos, t.vel) / t.vel.sqrMagnitude;
+        return t.pos + t.vel * Mathf.Clamp(tc, 0f, BotConfig.ENEMY_LOOKAHEAD);
     }
 
     // ── LootAttraction (combat mode) ───────────────────────────────────────────
